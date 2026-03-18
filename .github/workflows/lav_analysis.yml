@@ -4,23 +4,30 @@ name: LAV Labour-AI-Volt Analysis
 # Triggers
 # ─────────────────────────────────────────────────────────────────────────────
 on:
-  # Automatic: every Monday at 06:00 UTC (fresh weekly data pull)
+  # Automatic: every Monday at 06:00 UTC.
+  # The World Bank publishes annual employment data throughout the year.
+  # The pipeline auto-detects the latest available year on every run via the
+  # API's `mrv=1` (most-recent-value) endpoint — so new data is captured
+  # automatically as soon as it appears, with no manual year_end changes needed.
   schedule:
     - cron: '0 6 * * 1'
 
-  # Manual: trigger from the Actions tab with optional parameter overrides
+  # Manual: trigger from the Actions tab with optional overrides
   workflow_dispatch:
     inputs:
-      data_dir:
-        description: 'Input data directory (relative to repo root)'
+      countries:
+        description: >
+          Countries to analyse: 'all' for all embedded Volt countries, or a
+          comma-separated list of ISO-2 codes (e.g. 'DE,FR,NL').
+          Leave blank to use the embedded list automatically.
         required: false
-        default: 'LAV_data'
+        default: 'all'
       output_dir:
         description: 'Output directory (relative to repo root)'
         required: false
         default: 'LAV_results'
 
-  # Automatic: re-run whenever country configs or analysis scripts change
+  # Automatic: re-run whenever analysis scripts change
   push:
     branches:
       - main
@@ -59,17 +66,18 @@ jobs:
         run: pip install -r Python/requirements.txt
 
       # ── 3. Run the LAV analysis pipeline ──────────────────────────────────
-      #    lav_run.py orchestrates: api_reader → normalizing_processor →
-      #    displacement_analyzer + trend_analyzer → volt_report_analyzer.
-      #    No Nextflow or Java is required in CI; the output structure mirrors
-      #    the Nextflow pipeline (LAV_results/LAV_l1/<id>/ + LAV_results/LAV_l2/).
+      #    --countries all  →  uses the embedded Volt country list; no LAV_data/
+      #                        config files are required.
+      #    year_end is omitted  →  api_reader auto-detects the latest year
+      #                            currently available in the World Bank API,
+      #                            so new data is picked up the moment it is
+      #                            published without any code changes.
       - name: Run LAV pipeline
         env:
-          # Disable progress bars / colour codes that clutter CI logs
           PYTHONUNBUFFERED: '1'
         run: |
           python Python/lav_run.py \
-            --data-dir   "${{ github.event.inputs.data_dir   || 'LAV_data' }}" \
+            --countries  "${{ github.event.inputs.countries  || 'all' }}" \
             --output-dir "${{ github.event.inputs.output_dir || 'LAV_results' }}"
 
       # ── 4. Upload results as a downloadable artifact ──────────────────────
@@ -77,27 +85,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lav-results-${{ github.run_number }}
-          # Upload the full LAV_results tree (l1 + l2) so analysts can inspect
-          # every country's parquet files without cloning.
           path: LAV_results/
-          # Keep artifacts for 90 days (adjust as needed)
           retention-days: 90
-          # Don't fail the job if there are no results (e.g. all API calls failed)
           if-no-files-found: warn
 
       # ── 5. Commit results back to the repository ──────────────────────────
-      #    The LAV_results/.gitignore allows parquet files when they live inside
-      #    LAV_l1/ or LAV_l2/ subdirectories that are tracked.
-      #    Only commits if there are actual changes (idempotent).
+      #    Only commits when there are actual changes (idempotent).
       - name: Commit and push results
         run: |
           git config user.name  "LAV Pipeline [bot]"
           git config user.email "lav-pipeline@automated.local"
 
-          # Stage only the results directory
           git add LAV_results/
 
-          # Commit only if there are staged changes
           if git diff --cached --quiet; then
             echo "No result changes to commit."
           else
