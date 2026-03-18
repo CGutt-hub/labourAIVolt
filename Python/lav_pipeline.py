@@ -1,27 +1,32 @@
 """
-LAV Pipeline — consolidated analysis and plotting module.
+LAV Pipeline — consolidated analysis module.
 
-All fetch, normalize, analysis, and plotting logic lives here.
+All fetch, pivot, analysis, and vis.parquet production lives here.
 Import from this module in:
-  - Python/lav_run.py                          (orchestrator, direct function calls)
+  - Python/lav_run.py                          (orchestrator — calls functions directly)
   - Python/readers/api_reader.py               (thin CLI wrapper for Nextflow)
-  - Python/processors/normalizing_processor.py (thin CLI wrapper)
-  - Python/analyzers/displacement_analyzer.py  (thin CLI wrapper)
-  - Python/analyzers/trend_analyzer.py         (thin CLI wrapper)
-  - Python/analyzers/volt_report_analyzer.py   (thin CLI wrapper)
+  - Python/processors/normalizing_processor.py (thin CLI wrapper for the pivot step)
 
-Plotting outputs:
-  _vis.parquet  — AnalysisToolbox interactive_plotter format; bar charts
-                  showing employment share and displacement year-by-year.
-                  Registered into a single HTML archive via register_vis()
-                  which calls interactive_plotter.py from the AnalysisToolbox.
-                  In Nextflow the IOInterface bash block auto-calls the plotter.
+AnalysisToolbox modules used directly:
+  - analyzers/group_analyzer.py   → cross-country sector aggregation in generate_volt_report()
+  - utils/interactive_plotter.py  → HTML archive registration via register_vis()
+
+Missing AnalysisToolbox building blocks (flagged for addition):
+  - timeseries_ols_processor.py   → OLS on (x_col: year, y_cols: indicator cols) in wide parquet;
+                                    would replace the linregress loops in analyze_ols().
+  - pivot_processor.py            → long→wide parquet pivot; would replace normalize().
+
+Every analysis function writes its own _vis.parquet files to work_dir so that
+interactive_plotter.py can register them into the HTML archive.
 """
 
+import contextlib
+import importlib
 import os
 import sys
 import time
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import polars as pl
@@ -32,6 +37,68 @@ from scipy import stats
 def log_info(msg, tag="lav"):    print(f"[{tag}] INFO: {msg}")
 def log_warning(msg, tag="lav"): print(f"[{tag}] WARNING: {msg}")
 def log_error(msg, tag="lav"):   print(f"[{tag}] ERROR: {msg}")
+
+# ── AnalysisToolbox integration ───────────────────────────────────────────────
+# Modules are imported lazily so the pipeline works without the sibling repo;
+# only the HTML archive registration and cross-country group vis.parquet are
+# affected when the AT repo is absent.
+
+_AT_PYTHON: Optional[str] = None
+
+
+def _at_python_path() -> Optional[str]:
+    """Locate the AnalysisToolbox/Python/ directory (sibling repo).
+
+    Resolution order:
+      1. AT_PYTHON_PATH env var
+      2. ../AnalysisToolbox/Python/ relative to this repo root
+    """
+    global _AT_PYTHON
+    if _AT_PYTHON is not None:
+        return _AT_PYTHON
+    env = os.environ.get("AT_PYTHON_PATH", "")
+    if env and os.path.isdir(env):
+        _AT_PYTHON = env
+        return _AT_PYTHON
+    this_repo  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidate  = os.path.join(os.path.dirname(this_repo), "AnalysisToolbox", "Python")
+    if os.path.isdir(candidate):
+        _AT_PYTHON = candidate
+        return _AT_PYTHON
+    log_warning(
+        f"AnalysisToolbox not found at: {candidate}\n"
+        "  Clone https://github.com/CGutt-hub/AnalysisToolbox alongside this repo,\n"
+        "  or set AT_PYTHON_PATH env var.",
+        "at",
+    )
+    return None
+
+
+def _at_module(dotpath: str):
+    """Import an AnalysisToolbox module by dotpath (e.g. 'analyzers.group_analyzer').
+    Returns the module, or None if the AT repo is not available."""
+    at_path = _at_python_path()
+    if not at_path:
+        return None
+    if at_path not in sys.path:
+        sys.path.insert(0, at_path)
+    try:
+        return importlib.import_module(dotpath)
+    except ImportError as exc:
+        log_warning(f"Cannot import AT module '{dotpath}': {exc}", "at")
+        return None
+
+
+@contextlib.contextmanager
+def _in_dir(path: str):
+    """Context manager: temporarily change cwd to *path*.
+    Required because AT modules write output relative to os.getcwd()."""
+    old = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_YEAR_START = 2000
@@ -206,232 +273,306 @@ def normalize(df_raw):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. DISPLACEMENT ANALYSIS
+# 3. OLS ANALYSIS  (trends + displacement — same math, one function)
+#
+# NOTE: This implements what `timeseries_ols_processor.py` would provide once
+#       added to the AnalysisToolbox.  That module should accept:
+#           (x_col: year, y_cols: indicator columns, wide-format parquet)
+#       and output slope / se / p_value / r_squared per column + _vis.parquet.
+#
+#       The displacement score = max(0, -slope/mean) × automation_risk is a
+#       scalar weighting applied after the OLS step.  Once the AT module exists,
+#       only the Frey & Osborne weight table and that formula stay in LAV.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _linear_trend(years, values):
-    if len(years) < 3:
-        return 0.0, 1.0, 0.0
-    slope, _, r, p, _ = stats.linregress(years, values)
-    return float(slope), float(p), float(r ** 2)
+def analyze_ols(df_wide, work_dir):
+    """
+    Time-series OLS for all TREND_INDICATORS (year as x, value as y).
 
+    For SECTOR_COLUMNS additionally computes:
+        displacement_signal = max(0, -slope / mean)
+        displacement_score  = displacement_signal × automation_risk (Frey & Osborne)
 
-def analyze_displacement(df_wide):
-    """Compute per-sector AI displacement scores. Returns displacement DataFrame."""
-    tag = "displacement_analyzer"
+    Writes to work_dir:
+        {pid}_ols_vis.parquet         — bar chart: OLS slope per indicator
+        {pid}_displacement_vis.parquet — bar chart: displacement score per sector
+
+    Returns df_ols (one row per indicator; displacement columns null for non-sectors).
+    """
+    tag = "ols_analyzer"
     if len(df_wide) == 0:
         return pl.DataFrame()
     country        = df_wide["country"][0]
     iso3           = df_wide["iso3"][0]
     participant_id = df_wide["participant_id"][0]
-    log_info(f"Analyzing: {country} ({iso3})", tag)
-    records = []
-    for sector, col in SECTOR_COLUMNS.items():
-        if col not in df_wide.columns:
-            log_warning(f"Column '{col}' missing — skipping '{sector}'", tag)
-            continue
-        sector_df = df_wide.select(["year", col]).filter(pl.col(col).is_not_null()).sort("year")
-        if len(sector_df) < 3:
-            continue
-        years  = sector_df["year"].to_numpy().astype(float)
-        values = sector_df[col].to_numpy().astype(float)
-        slope, p_value, r_sq = _linear_trend(years, values)
-        mean_val            = float(np.mean(values))
-        displacement_signal = float(max(0.0, -slope / (mean_val + 1e-9)))
-        automation_risk     = AUTOMATION_RISK[sector]
-        records.append({
-            "participant_id":               participant_id,
-            "country":                      country,
-            "iso3":                         iso3,
-            "sector":                       sector,
-            "employment_mean_pct":          round(mean_val, 3),
-            "employment_latest_pct":        round(float(values[-1]), 3),
-            "trend_slope_pp_per_yr":        round(slope, 4),
-            "trend_p_value":                round(p_value, 4),
-            "trend_significant":            bool(p_value < 0.05),
-            "trend_r_squared":              round(r_sq, 4),
-            "displacement_signal":          round(displacement_signal, 5),
-            "automation_risk_frey_osborne": automation_risk,
-            "displacement_score":           round(displacement_signal * automation_risk, 5),
-            "year_start":                   int(years[0]),
-            "year_end":                     int(years[-1]),
-            "n_observations":               len(years),
-        })
-    if not records:
-        return pl.DataFrame()
-    result = pl.DataFrame(records)
-    for row in sorted(records, key=lambda x: x["displacement_score"], reverse=True):
-        sig = " **" if row["trend_significant"] else ""
-        log_info(f"  {row['sector']:12s}: score={row['displacement_score']:.4f}  "
-                 f"slope={row['trend_slope_pp_per_yr']:+.3f}pp/yr{sig}", tag)
-    return result
+    log_info(f"OLS analysis: {country} ({iso3})", tag)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. TREND ANALYSIS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def analyze_trends(df_wide):
-    """OLS slope + p + R² per indicator. Returns trends DataFrame."""
-    tag = "trend_analyzer"
-    if len(df_wide) == 0:
-        return pl.DataFrame()
-    country        = df_wide["country"][0]
-    iso3           = df_wide["iso3"][0]
-    participant_id = df_wide["participant_id"][0]
     records = []
     for indicator in TREND_INDICATORS:
         if indicator not in df_wide.columns:
             continue
         data = (df_wide.select(["year", indicator])
-                .filter(pl.col(indicator).is_not_null()).sort("year"))
+                .filter(pl.col(indicator).is_not_null())
+                .sort("year"))
         if len(data) < 3:
             continue
         years  = data["year"].to_numpy().astype(float)
         values = data[indicator].to_numpy().astype(float)
         slope, _, r, p, se = stats.linregress(years, values)
+
+        # Displacement fields — populated only for sector indicators
+        sector     = next((s for s, col in SECTOR_COLUMNS.items() if col == indicator), None)
+        risk       = AUTOMATION_RISK.get(sector) if sector else None
+        mean_val   = float(np.mean(values))
+        signal     = float(max(0.0, -slope / (mean_val + 1e-9))) if sector else None
+        disp_score = round(signal * risk, 5) if (signal is not None and risk is not None) else None
+
         records.append({
-            "participant_id":    participant_id,
-            "country":           country,
-            "iso3":              iso3,
-            "indicator":         indicator,
-            "trend_slope":       round(float(slope), 6),
-            "trend_slope_se":    round(float(se), 6),
-            "trend_p_value":     round(float(p), 5),
-            "trend_r_squared":   round(float(r ** 2), 4),
-            "trend_significant": bool(p < 0.05),
-            "value_first":       round(float(values[0]), 4),
-            "value_last":        round(float(values[-1]), 4),
-            "value_mean":        round(float(np.mean(values)), 4),
-            "total_change_pct":  round((values[-1] - values[0]) / (abs(values[0]) + 1e-9) * 100, 2),
-            "year_start":        int(years[0]),
-            "year_end":          int(years[-1]),
-            "n_observations":    len(years),
+            "participant_id":      participant_id,
+            "country":             country,
+            "iso3":                iso3,
+            "indicator":           indicator,
+            "sector":              sector,
+            "trend_slope":         round(float(slope), 6),
+            "trend_slope_se":      round(float(se), 6),
+            "trend_p_value":       round(float(p), 5),
+            "trend_r_squared":     round(float(r ** 2), 4),
+            "trend_significant":   bool(p < 0.05),
+            "value_first":         round(float(values[0]), 4),
+            "value_last":          round(float(values[-1]), 4),
+            "value_mean":          round(mean_val, 4),
+            "total_change_pct":    round(
+                (values[-1] - values[0]) / (abs(values[0]) + 1e-9) * 100, 2),
+            "year_start":          int(years[0]),
+            "year_end":            int(years[-1]),
+            "n_observations":      len(years),
+            "automation_risk":     risk,
+            "displacement_signal": round(signal, 5) if signal is not None else None,
+            "displacement_score":  disp_score,
         })
+
     if not records:
         return pl.DataFrame()
-    result    = pl.DataFrame(records)
+
+    df_ols    = pl.DataFrame(records)
     sig_count = sum(1 for r in records if r["trend_significant"])
-    log_info(f"Significant trends (p<0.05): {sig_count}/{len(records)}", tag)
-    for row in sorted(records, key=lambda x: abs(x["trend_slope"]), reverse=True)[:5]:
-        log_info(f"  {row['indicator']:35s}: slope={row['trend_slope']:+.4f}/yr  "
-                 f"p={row['trend_p_value']:.3f}{'  **' if row['trend_significant'] else ''}", tag)
-    return result
+    log_info(f"OLS: {len(records)} indicators, {sig_count} significant (p<0.05)", tag)
+    for row in [r for r in records if r.get("displacement_score") is not None]:
+        sig = " **" if row["trend_significant"] else ""
+        log_info(f"  {row['sector']:12s}: score={row['displacement_score']:.4f}  "
+                 f"slope={row['trend_slope']:+.4f}/yr{sig}", tag)
+
+    os.makedirs(work_dir, exist_ok=True)
+
+    # vis 1 — OLS slope bar chart (all indicators)
+    indicators = [r["indicator"] for r in records]
+    slopes     = [r["trend_slope"] for r in records]
+    sig_flags  = [r["trend_significant"] for r in records]
+    _make_vis(
+        "bar", f"OLS Trends (slope/yr) — {country}",
+        "Indicator", "Slope (units/yr)",
+        [("* " if s else "") + ind for s, ind in zip(sig_flags, indicators)],
+        indicators, [slopes],
+    ).write_parquet(
+        os.path.join(work_dir, f"{participant_id}_ols_vis.parquet"),
+        compression="snappy",
+    )
+
+    # vis 2 — displacement score bar chart (sectors only)
+    sector_rows = sorted(
+        [r for r in records if r.get("displacement_score") is not None],
+        key=lambda x: x["displacement_score"], reverse=True,
+    )
+    if sector_rows:
+        _make_vis(
+            "bar", f"AI Displacement Score — {country}",
+            "Sector", "Score (signal × automation risk)",
+            ["Displacement Score"],
+            [r["sector"] for r in sector_rows],
+            [[r["displacement_score"] for r in sector_rows]],
+        ).write_parquet(
+            os.path.join(work_dir, f"{participant_id}_displacement_vis.parquet"),
+            compression="snappy",
+        )
+
+    return df_ols
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. GROUP REPORT (L2)
+# 4. CROSS-COUNTRY REPORT  (group synthesis — uses AT modules directly)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _concat_frames(frames):
     valid = [f for f in (frames or []) if f is not None and len(f) > 0]
-    return pl.concat(valid, how="diagonal") if valid else None
+    return pl.concat(valid, how="diagonal_relaxed") if valid else None
 
 
-def generate_volt_report(disp_dfs, trend_dfs, output_dir):
+def generate_volt_report(all_ols_dfs, output_dir):
     """
-    Aggregate per-country DataFrames into cross-country report.
-    Writes LAV_volt_report, LAV_displacement_summary, LAV_trends_summary
-    parquets to output_dir.  Returns the policy_metrics DataFrame.
+    Cross-country synthesis — uses AnalysisToolbox modules:
+
+      group_analyzer.analyze_groups()    → EU-average displacement vis.parquet
+                                           (one bar-chart row per country in
+                                            interactive_plotter's grid view)
+
+      normalizing_processor.normalize()  → min-max DRS (deferred; currently
+                                           done inline — two lines of polars).
+                                           Activate once pivot_processor.py
+                                           provides the value_last column in a
+                                           standalone parquet.
+
+    Returns policy DataFrame (ADPI, DRS, vulnerability_score per country).
     """
     tag = "volt_report"
     os.makedirs(output_dir, exist_ok=True)
-    df_disp   = _concat_frames(disp_dfs)
-    df_trends = _concat_frames(trend_dfs)
 
-    if df_disp is None and df_trends is None:
-        log_warning("No valid group inputs — writing empty report", tag)
+    valid = [df for df in (all_ols_dfs or []) if df is not None and len(df) > 0]
+    if not valid:
+        log_warning("No valid OLS inputs — writing empty report", tag)
         pl.DataFrame().write_parquet(
             os.path.join(output_dir, "LAV_volt_report.parquet"), compression="snappy")
         return pl.DataFrame()
 
-    # Displacement ranking
-    disp_sum = pl.DataFrame()
-    if df_disp is not None and len(df_disp) > 0:
-        df_ranked = (df_disp
-                     .sort(["sector", "displacement_score"], descending=[False, True])
-                     .with_columns(
-                         pl.col("displacement_score")
-                         .rank(method="dense", descending=True).over("sector")
-                         .alias("rank_in_sector")))
-        disp_sum = df_ranked
-        for row in (df_disp.group_by("sector")
-                    .agg(pl.col("displacement_score").mean().round(5).alias("eu_mean"),
-                         pl.col("displacement_score").max().round(5).alias("eu_max"))
-                    .sort("eu_mean", descending=True).iter_rows(named=True)):
-            log_info(f"  {row['sector']:12s}: EU avg={row['eu_mean']:.4f}  "
-                     f"max={row['eu_max']:.4f}", tag)
+    df_all = pl.concat(valid, how="diagonal_relaxed")
+    df_all.write_parquet(
+        os.path.join(output_dir, "LAV_ols_summary.parquet"), compression="snappy")
 
-    # Trend summary
-    trend_sum = pl.DataFrame()
-    if df_trends is not None and len(df_trends) > 0:
-        KEY = ["employment_industry_pct", "employment_services_pct", "unemployment_rate",
-               "internet_users_pct", "high_tech_exports_pct_mfg"]
-        trend_sum = (df_trends.filter(pl.col("indicator").is_in(KEY))
-                     .group_by("indicator")
-                     .agg(pl.col("trend_slope").mean().round(5).alias("eu_mean_slope"),
-                          pl.col("trend_slope").std().round(5).alias("eu_std_slope"),
-                          pl.col("total_change_pct").mean().round(2).alias("eu_mean_total_change_pct"),
-                          pl.col("trend_significant").sum().alias("n_significant"),
-                          pl.len().alias("n_countries"))
-                     .sort("indicator"))
+    # ── Displacement subset ───────────────────────────────────────────────────
+    df_disp = df_all.filter(pl.col("displacement_score").is_not_null())
 
-    # Policy metrics
-    policy = pl.DataFrame()
-    if df_disp is not None and len(df_disp) > 0:
-        adpi = (df_disp.group_by(["participant_id", "country", "iso3"])
-                .agg(pl.col("displacement_score").mean().round(5).alias("adpi"),
-                     pl.col("displacement_score").max().round(5).alias("adpi_max_sector"),
-                     pl.col("sector")
-                     .sort_by(df_disp["displacement_score"]).last()
-                     .alias("most_at_risk_sector")))
-        if df_trends is not None and len(df_trends) > 0:
-            drs_df = (df_trends
-                      .filter(pl.col("indicator").is_in(
-                          ["internet_users_pct", "high_tech_exports_pct_mfg"]))
-                      .group_by(["participant_id", "country", "iso3"])
-                      .agg(pl.col("value_last").mean().round(3).alias("drs_raw")))
-            drs_max = drs_df["drs_raw"].max() or 1.0
-            drs_df  = drs_df.with_columns((pl.col("drs_raw") / drs_max).round(4).alias("drs"))
-            policy  = (adpi.join(drs_df.select(["participant_id", "drs"]),
-                                 on="participant_id", how="left")
-                       .with_columns(
-                           (pl.col("adpi") / (pl.col("drs") + 0.01)).round(5)
-                           .alias("vulnerability_score")))
+    if len(df_disp) > 0:
+        # Build epoch-format parquet for AT group_analyzer:
+        #   condition = country  (each country is one "condition")
+        #   epoch_id  = "run"    (single epoch per country)
+        #   columns   = sectors  (displacement scores)
+        #
+        # group_analyzer computes mean ± SEM per sector across epochs (countries)
+        # and writes a _vis.parquet with one row per condition (country).
+        epoch_df = (
+            df_disp.pivot(values="displacement_score",
+                          index=["country"], on="sector")
+            .rename({"country": "epoch_id"})
+            .with_columns(pl.lit("AI_Displacement").alias("condition"))
+        )
+        epoch_path = os.path.join(output_dir, "LAV_displacement_epoch.parquet")
+        epoch_df.write_parquet(epoch_path, compression="snappy")
+
+        ga = _at_module("analyzers.group_analyzer")
+        if ga is not None:
+            import json
+            present_sectors = [s for s in SECTOR_COLUMNS if s in epoch_df.columns]
+            groups_cfg = json.dumps({s: [s] for s in present_sectors})
+            with _in_dir(output_dir):
+                ga.analyze_groups(
+                    epoch_path, groups_cfg,
+                    x_label="Sector", y_label="AI Displacement Score",
+                    suffix="displacement_grp",
+                )
+            log_info("AT group_analyzer: cross-country displacement vis.parquet written", tag)
         else:
-            policy = adpi.with_columns(
-                [pl.lit(None).cast(pl.Float64).alias("drs"),
-                 pl.lit(None).cast(pl.Float64).alias("vulnerability_score")])
-        policy = policy.sort("adpi", descending=True)
-        log_info(f"  {'Country':15s} {'ADPI':>8} {'DRS':>8} {'Vulnerability':>14}", tag)
-        for row in policy.iter_rows(named=True):
-            log_info(f"  {row['country']:15s} {row['adpi']:8.4f} "
-                     f"{row['drs'] or 0.0:8.4f} "
-                     f"{row['vulnerability_score'] or 0.0:14.4f}", tag)
+            # Fallback: inline cross-country grouped bar vis.parquet
+            log_warning("AT group_analyzer unavailable — producing inline fallback vis", tag)
+            countries = sorted(df_disp["country"].unique().to_list())
+            labels, y_data = [], []
+            for sector in SECTOR_COLUMNS:
+                scores = []
+                for c in countries:
+                    row = df_disp.filter(
+                        (pl.col("country") == c) & (pl.col("sector") == sector))
+                    scores.append(float(row["displacement_score"][0]) if len(row) > 0 else 0.0)
+                labels.append(sector)
+                y_data.append(scores)
+            _make_vis(
+                "bar", "AI Displacement by Country & Sector",
+                "Country", "Displacement Score",
+                labels, countries, y_data,
+            ).write_parquet(
+                os.path.join(output_dir, "LAV_displacement_epoch_displacement_grp_vis.parquet"),
+                compression="snappy",
+            )
 
-    # Write outputs
-    if len(disp_sum) > 0:
-        disp_sum.write_parquet(os.path.join(output_dir, "LAV_displacement_summary.parquet"),
-                               compression="snappy")
-    if len(trend_sum) > 0:
-        trend_sum.write_parquet(os.path.join(output_dir, "LAV_trends_summary.parquet"),
-                                compression="snappy")
-    parts = []
-    if df_disp is not None and len(df_disp) > 0:
-        parts.append(df_disp.with_columns(pl.lit("displacement").alias("table_type")))
-    if len(policy) > 0:
-        parts.append(policy.with_columns(pl.lit("policy_metrics").alias("table_type")))
-    (pl.concat(parts, how="diagonal") if parts else pl.DataFrame()).write_parquet(
+    # ── ADPI per country = mean displacement across sectors ───────────────────
+    adpi_df = (
+        df_disp.group_by(["participant_id", "country", "iso3"])
+        .agg(
+            pl.col("displacement_score").mean().round(5).alias("adpi"),
+            pl.col("displacement_score").max().round(5).alias("adpi_max_sector"),
+            pl.col("sector").sort_by("displacement_score").last()
+              .alias("most_at_risk_sector"),
+        )
+        .sort("adpi", descending=True)
+    )
+    for row in adpi_df.iter_rows(named=True):
+        log_info(f"  {row['country']:15s}: ADPI={row['adpi']:.4f}  "
+                 f"most-at-risk={row['most_at_risk_sector']}", tag)
+
+    # ── DRS per country (digital readiness signal) ────────────────────────────
+    # AT: normalizing_processor.normalize(path, 'minmax', 'drs_raw') would do
+    # the min-max step once drs_raw is available in a standalone parquet file.
+    DRS_INDICATORS = ["internet_users_pct", "high_tech_exports_pct_mfg"]
+    drs_rows = []
+    for pid in df_all["participant_id"].unique().to_list():
+        sub     = df_all.filter(pl.col("participant_id") == pid)
+        country = sub["country"][0]
+        vals    = [
+            float(sub.filter(pl.col("indicator") == ind)["value_last"][0])
+            for ind in DRS_INDICATORS
+            if ind in sub["indicator"].to_list()
+               and sub.filter(pl.col("indicator") == ind)["value_last"][0] is not None
+        ]
+        drs_rows.append({
+            "participant_id": pid,
+            "country":        country,
+            "drs_raw":        float(np.mean(vals)) if vals else 0.0,
+        })
+    drs_df  = pl.DataFrame(drs_rows)
+    drs_max = drs_df["drs_raw"].max() or 1.0
+    # AT normalizing_processor.normalize(path, 'minmax', 'drs_raw') equivalent:
+    drs_df = drs_df.with_columns((pl.col("drs_raw") / drs_max).round(4).alias("drs"))
+
+    # ── Policy table: ADPI + DRS + vulnerability ──────────────────────────────
+    policy = (
+        adpi_df.join(drs_df.select(["participant_id", "drs"]),
+                     on="participant_id", how="left")
+        .with_columns(
+            (pl.col("adpi") / (pl.col("drs") + 0.01)).round(5)
+            .alias("vulnerability_score"))
+        .sort("adpi", descending=True)
+    )
+    log_info(f"  {'Country':15s} {'ADPI':>8} {'DRS':>8} {'Vulnerability':>14}", tag)
+    for row in policy.iter_rows(named=True):
+        log_info(f"  {row['country']:15s} {row['adpi']:8.4f} "
+                 f"{row['drs'] or 0.0:8.4f} "
+                 f"{row['vulnerability_score'] or 0.0:14.4f}", tag)
+
+    # ── Vulnerability vis.parquet ─────────────────────────────────────────────
+    df_s = policy.sort("vulnerability_score", descending=True)
+    _make_vis(
+        "bar", "Labour Displacement Vulnerability",
+        "Country", "Score",
+        ["Vulnerability (ADPI/DRS)", "ADPI"],
+        df_s["country"].to_list(),
+        [
+            [round(v or 0.0, 4) for v in df_s["vulnerability_score"].to_list()],
+            [round(v or 0.0, 4) for v in df_s["adpi"].to_list()],
+        ],
+    ).write_parquet(
+        os.path.join(output_dir, "LAV_vulnerability_vis.parquet"),
+        compression="snappy",
+    )
+
+    policy.write_parquet(
         os.path.join(output_dir, "LAV_volt_report.parquet"), compression="snappy")
-    log_info(f"Saved group report → {output_dir}", tag)
+    log_info(f"Saved volt report → {output_dir}", tag)
     return policy
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 6. PLOTTING — AnalysisToolbox _vis.parquet format
-#    Schema: one row per plot; x_data flat List, y_data nested List[List]
-#    bar  → grouped bars (year-by-year per sector)
-#    Picked up automatically by IOInterface bash block in Nextflow.
+# 5. YEAR-BY-YEAR VIS HELPERS  (time-series views — no AT equivalent yet)
+#
+# These produce the year-by-year grouped bar charts showing how employment
+# shares and unemployment rates evolved over time.  They are unique to the
+# LAV analysis (no generic AT module covers this layout today).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _extract_ts(df_wide, col):
@@ -444,7 +585,7 @@ def _extract_ts(df_wide, col):
 
 def _make_vis(plot_type, title, x_label, y_label, labels, x_data, y_data):
     """
-    Build a single-row _vis.parquet DataFrame.
+    Build a single-row _vis.parquet DataFrame in AT interactive_plotter schema.
 
     x_data : flat list  — shared x-axis (years as float, or category strings)
     y_data : list of lists — one sub-list per series
@@ -469,8 +610,7 @@ def _make_vis(plot_type, title, x_label, y_label, labels, x_data, y_data):
 def make_sector_employment_vis(df_wide):
     """
     Grouped bar: employment share by sector, one group per year.
-    Shows year-by-year displacement development directly from the raw data.
-    Returns vis DataFrame, or None if no sector columns are present.
+    Writes to caller; returns vis DataFrame or None.
     """
     country = df_wide["country"][0]
     labels, y_data, x_years = [], [], None
@@ -495,10 +635,10 @@ def make_sector_employment_vis(df_wide):
 def make_unemployment_vis(df_wide):
     """
     Grouped bar: unemployment rate + youth unemployment, year-by-year.
-    Returns vis DataFrame, or None.
+    Writes to caller; returns vis DataFrame or None.
     """
     country = df_wide["country"][0]
-    SERIES  = {"unemployment_rate": "Unemployment Rate (%)",
+    SERIES  = {"unemployment_rate":       "Unemployment Rate (%)",
                "youth_unemployment_rate": "Youth Unemployment (%)"}
     labels, y_data, x_years = [], [], None
     for col, label in SERIES.items():
@@ -519,77 +659,18 @@ def make_unemployment_vis(df_wide):
                      labels, x_years, y_data)
 
 
-def make_displacement_score_vis(df_disp):
-    """
-    Bar chart: AI displacement score per sector for one country.
-    Returns vis DataFrame, or None.
-    """
-    if df_disp is None or len(df_disp) == 0:
-        return None
-    country   = df_disp["country"][0]
-    df_sorted = df_disp.sort("displacement_score", descending=True)
-    sectors   = df_sorted["sector"].to_list()
-    scores    = [round(v, 5) for v in df_sorted["displacement_score"].to_list()]
-    return _make_vis("bar",
-                     f"AI Displacement Score by Sector — {country}",
-                     "Sector", "Displacement Score",
-                     ["Displacement Score (Frey & Osborne)"],
-                     sectors, [scores])
-
-
-def make_group_adpi_vis(df_disp_all):
-    """
-    Grouped bar: displacement score per sector, one group per country.
-    Returns vis DataFrame, or None.
-    """
-    if df_disp_all is None or len(df_disp_all) == 0:
-        return None
-    countries = sorted(df_disp_all["country"].unique().to_list())
-    labels, y_data = [], []
-    for sector in SECTOR_COLUMNS:
-        scores = []
-        for country in countries:
-            row = df_disp_all.filter(
-                (pl.col("country") == country) & (pl.col("sector") == sector))
-            scores.append(float(row["displacement_score"][0]) if len(row) > 0 else 0.0)
-        labels.append(sector)
-        y_data.append(scores)
-    return _make_vis("bar",
-                     "AI Displacement Score by Country and Sector",
-                     "Country", "Displacement Score",
-                     labels, countries, y_data)
-
-
-def make_vulnerability_vis(policy_df):
-    """
-    Bar chart: vulnerability score (ADPI/DRS) per country.
-    Returns vis DataFrame, or None.
-    """
-    if policy_df is None or len(policy_df) == 0:
-        return None
-    df = policy_df.sort("vulnerability_score", descending=True)
-    countries = df["country"].to_list()
-    vulns     = [round(v or 0.0, 4) for v in df["vulnerability_score"].to_list()]
-    adpis     = [round(v or 0.0, 4) for v in df["adpi"].to_list()]
-    return _make_vis("bar",
-                     "Labour Displacement Vulnerability by Country",
-                     "Country", "Score",
-                     ["Vulnerability (ADPI/DRS)", "ADPI"],
-                     countries, [vulns, adpis])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 7. PLOTTING — call interactive_plotter.py from the AnalysisToolbox
+# 6. INTERACTIVE PLOTTER BRIDGE  (AT interactive_plotter.py)
 #
-#    interactive_plotter.py turns every _vis.parquet into an entry in a single
-#    interactive HTML archive with collapsible tree navigation and Plotly charts.
+#    Every _vis.parquet is registered into a single interactive HTML archive
+#    with collapsible tree navigation and Plotly charts.
 #
 #    CLI:  python interactive_plotter.py <vis.parquet> <out_dir> <prefix>
 #                                        <project_name> <sidecar_dir>
 #
-#    The AnalysisToolbox is expected as a sibling directory of this repo:
-#      ../AnalysisToolbox/Python/utils/interactive_plotter.py
-#    Override with env var INTERACTIVE_PLOTTER_PATH if stored elsewhere.
+#    Uses the same sibling-repo resolution as _at_python_path().
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def find_interactive_plotter():

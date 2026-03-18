@@ -4,25 +4,21 @@
 // Core framework processes
 include { participant_discovery; finalize_participant; finalize_l2 } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
 
-// ── Readers ──────────────────────────────────────────────────────────────
+// ── Readers ───────────────────────────────────────────────────────────────
 // Fetches labour market data from World Bank API for one country
 include { IOInterface as api_reader } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
 
-// ── Processors ───────────────────────────────────────────────────────────
-// Cleans and pivots raw long-format data to wide time-series
+// ── Processors ────────────────────────────────────────────────────────────
+// Pivots raw long-format data to wide time-series (not statistical normalization)
 include { IOInterface as normalizing_processor } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
 
-// ── Analyzers (L1 — per country) ─────────────────────────────────────────
-// Computes AI displacement scores by sector (Frey & Osborne cross-reference)
-include { IOInterface as displacement_analyzer } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
-
-// Fits linear time-series trends to every labour indicator
-include { IOInterface as trend_analyzer } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
-
-// ── File finders (extract specific outputs from multi-file processes) ─────
-include { IOInterface as displacement_file_finder } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
-include { IOInterface as trend_file_finder        } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
+// ── OLS Analyzer (L1 — per country) ──────────────────────────────────────
+// Single step: time-series OLS for all indicators + displacement scores
+// (Consolidates former displacement_analyzer + trend_analyzer)
+// Produces: {pid}_ols.parquet, {pid}_ols_vis.parquet, {pid}_displacement_vis.parquet
+include { IOInterface as ols_analyzer } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'
 
 // ── Group-level (L2 — cross-country) ─────────────────────────────────────
-// Synthesises all countries: displacement ranking, trend comparison, Volt policy metrics
+// Synthesises all countries via AT group_analyzer + policy table
+// Produces: LAV_volt_report.parquet, cross-country vis.parquets
 include { IOInterface as volt_report_analyzer } from '../../AnalysisToolbox/Python/utils/workflow_wrapper.nf'

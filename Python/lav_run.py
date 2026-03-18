@@ -1,12 +1,13 @@
 """
 LAV Run — standalone orchestrator (no Nextflow, no subprocesses).
 
-Calls lav_pipeline functions directly in-process for maximum efficiency:
-  api_reader → normalize → displacement_analyzer + trend_analyzer
-  → volt_report_analyzer → plots (vis.parquet + standalone HTML)
+Calls lav_pipeline functions directly in-process:
+  api_reader -> pivot -> analyze_ols (OLS trends + displacement scores)
+  -> generate_volt_report (AT group_analyzer + policy table)
+  -> register vis.parquets with AT interactive_plotter
 
 Run modes
-─────────
+---------
   # Zero-config: uses the embedded Volt country list, auto year-end
   python Python/lav_run.py --countries all
 
@@ -18,7 +19,7 @@ Run modes
 
 Results land in:  <output_dir>/LAV_l1/<participant_id>/
 Group results in: <output_dir>/LAV_l2/
-HTML plots in:    <output_dir>/LAV_l1/<id>/plots/  and  <output_dir>/LAV_l2/plots/
+HTML archive:     <output_dir>/.bin/LAV_results.html  (requires AnalysisToolbox)
 """
 
 import argparse
@@ -30,16 +31,15 @@ import sys
 # Allow import from the Python/ package root regardless of cwd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lav_pipeline import (
-    fetch_country, normalize, analyze_displacement, analyze_trends,
-    generate_volt_report, _concat_frames,
+    fetch_country, normalize, analyze_ols,
+    generate_volt_report,
     make_sector_employment_vis, make_unemployment_vis,
-    make_displacement_score_vis, make_group_adpi_vis, make_vulnerability_vis,
     register_vis, find_interactive_plotter,
     VOLT_COUNTRIES, _VOLT_BY_ISO2,
     log_info, log_warning, log_error,
 )
 
-# ── Country resolution ────────────────────────────────────────────────────────
+# -- Country resolution --------------------------------------------------------
 
 def _load_config_files(data_dir):
     configs = []
@@ -72,76 +72,84 @@ def resolve_countries(data_dir, countries_arg):
             elif iso2 in _VOLT_BY_ISO2:
                 result.append(dict(_VOLT_BY_ISO2[iso2]))
             else:
-                log_warning(f"ISO-2 '{iso2}' not found — skipping")
+                log_warning(f"ISO-2 '{iso2}' not found -- skipping")
         return result
 
     if dir_configs:
         log_info(f"Using {len(dir_configs)} country configs from {data_dir}")
         return list(dir_configs.values())
 
-    log_info("No config files found — using embedded Volt country list (zero-config mode)")
+    log_info("No config files found -- using embedded Volt country list (zero-config mode)")
     return [dict(c) for c in VOLT_COUNTRIES]
 
 
-# ── Per-country L1 pipeline ───────────────────────────────────────────────────
+# -- Per-country L1 pipeline ---------------------------------------------------
 
 def process_country(cfg, l1_dir, output_dir, plotter=None):
-    """Run full L1 pipeline for one country. Returns (df_disp, df_trends) or (None, None)."""
+    """Run full L1 pipeline for one country. Returns df_ols or None."""
     pid      = cfg["participant_id"]
     work_dir = os.path.join(l1_dir, pid)
     sidecar  = os.path.join(work_dir, "plots")
     os.makedirs(work_dir, exist_ok=True)
 
-    log_info("─" * 60)
+    log_info("-" * 60)
     log_info(f"Processing: {cfg['country']} ({cfg['iso2']})  [{pid}]")
 
-    # Step 1 — Fetch
+    # Step 1 -- Fetch (World Bank REST API, auto year-end)
     df_raw = fetch_country(pid, cfg["country"], cfg["iso3"], cfg["iso2"],
                            year_start=cfg.get("year_start", 2000))
     if len(df_raw) == 0:
-        log_warning(f"No data fetched for {pid} — skipping")
-        return None, None
+        log_warning(f"No data fetched for {pid} -- skipping")
+        return None
     df_raw.write_parquet(os.path.join(work_dir, f"{pid}_api_raw.parquet"),
                          compression="snappy")
 
-    # Step 2 — Normalize
+    # Step 2 -- Pivot long->wide
+    # NOTE: AT pivot_processor.py would replace this step once added.
     df_wide = normalize(df_raw)
     if len(df_wide) == 0:
-        log_warning(f"Normalization produced empty result for {pid} — skipping")
-        return None, None
+        log_warning(f"Pivot produced empty result for {pid} -- skipping")
+        return None
     df_wide.write_parquet(os.path.join(work_dir, f"{pid}_normalized.parquet"),
                           compression="snappy")
 
-    # Step 3a — Displacement analysis
-    df_disp = analyze_displacement(df_wide)
-    if len(df_disp) > 0:
-        df_disp.write_parquet(os.path.join(work_dir, f"{pid}_displacement.parquet"),
+    # Step 3 -- OLS trends + displacement scores
+    # NOTE: AT timeseries_ols_processor.py would replace the linregress loops;
+    #       only the Frey & Osborne weighting stays in LAV.
+    # analyze_ols() writes its own _ols_vis and _displacement_vis parquets.
+    df_ols = analyze_ols(df_wide, work_dir)
+    if len(df_ols) == 0:
+        log_warning(f"OLS produced empty result for {pid} -- skipping")
+        return None
+    df_ols.write_parquet(os.path.join(work_dir, f"{pid}_ols.parquet"),
+                         compression="snappy")
+
+    # Step 4 -- Year-by-year vis.parquets (sector employment + unemployment)
+    for vis, prefix in [
+        (make_sector_employment_vis(df_wide), f"{pid}_sector_employment_vis"),
+        (make_unemployment_vis(df_wide),      f"{pid}_unemployment_vis"),
+    ]:
+        if vis is not None:
+            vis.write_parquet(os.path.join(work_dir, f"{prefix}.parquet"),
                               compression="snappy")
 
-    # Step 3b — Trend analysis
-    df_trends = analyze_trends(df_wide)
-    if len(df_trends) > 0:
-        df_trends.write_parquet(os.path.join(work_dir, f"{pid}_trends.parquet"),
-                                compression="snappy")
+    # Step 5 -- Register all vis.parquets with AT interactive_plotter
+    for fname in [
+        f"{pid}_ols_vis.parquet",
+        f"{pid}_displacement_vis.parquet",
+        f"{pid}_sector_employment_vis.parquet",
+        f"{pid}_unemployment_vis.parquet",
+    ]:
+        vis_path = os.path.join(work_dir, fname)
+        if os.path.exists(vis_path):
+            register_vis(vis_path, output_dir,
+                         fname.replace(".parquet", ""),
+                         sidecar, project="LAV", plotter=plotter)
 
-    # Step 4 — Build vis.parquets and register with AnalysisToolbox interactive_plotter
-    _vis_plots = [
-        (make_sector_employment_vis(df_wide),                               f"{pid}_sector_employment_vis"),
-        (make_unemployment_vis(df_wide),                                    f"{pid}_unemployment_vis"),
-        (make_displacement_score_vis(df_disp if len(df_disp) > 0 else None), f"{pid}_displacement_score_vis"),
-    ]
-    for vis, prefix in _vis_plots:
-        if vis is not None:
-            vis_path = os.path.join(work_dir, f"{prefix}.parquet")
-            vis.write_parquet(vis_path, compression="snappy")
-            register_vis(vis_path, output_dir, prefix, sidecar,
-                         project="LAV", plotter=plotter)
-
-    return (df_disp   if len(df_disp)   > 0 else None,
-            df_trends if len(df_trends) > 0 else None)
+    return df_ols
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 def main(data_dir, output_dir, countries_arg):
     repo_root  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -156,52 +164,52 @@ def main(data_dir, output_dir, countries_arg):
 
     country_list = resolve_countries(data_dir, countries_arg)
     if not country_list:
-        log_error("No countries to process — exiting.")
+        log_error("No countries to process -- exiting.")
         sys.exit(1)
     log_info(f"Countries to process: {len(country_list)}")
 
-    all_disp, all_trends, failed = [], [], []
     plotter = find_interactive_plotter()
     if plotter:
         log_info(f"AnalysisToolbox interactive_plotter found: {plotter}")
     else:
-        log_warning("AnalysisToolbox not found — vis.parquet files will be written "
-                    "but HTML archive will not be generated.\n"
+        log_warning("AnalysisToolbox not found -- vis.parquet files written but "
+                    "HTML archive skipped.\n"
                     "  Clone https://github.com/CGutt-hub/AnalysisToolbox alongside "
                     "this repo, or set INTERACTIVE_PLOTTER_PATH.")
+
+    all_ols, failed = [], []
     for cfg in country_list:
-        df_disp, df_trends = process_country(cfg, l1_dir, output_dir, plotter)
-        if df_disp is None and df_trends is None:
+        df_ols = process_country(cfg, l1_dir, output_dir, plotter)
+        if df_ols is None:
             failed.append(cfg["participant_id"])
-        if df_disp   is not None: all_disp.append(df_disp)
-        if df_trends is not None: all_trends.append(df_trends)
+        else:
+            all_ols.append(df_ols)
 
-    # L2 — Group report
-    log_info("─" * 60)
-    log_info("Running group-level Volt report …")
-    policy = generate_volt_report(all_disp, all_trends, l2_dir)
+    # L2 -- Group report (AT group_analyzer + policy table)
+    log_info("-" * 60)
+    log_info("Running group-level Volt report ...")
+    policy = generate_volt_report(all_ols, l2_dir)
 
-    # L2 vis.parquet — register with interactive_plotter
-    l2_sidecar  = os.path.join(l2_dir, "plots")
-    df_disp_all = _concat_frames(all_disp)
-    for vis, prefix in [
-        (make_group_adpi_vis(df_disp_all),                              "LAV_cross_country_adpi_vis"),
-        (make_vulnerability_vis(policy if len(policy) > 0 else None),   "LAV_vulnerability_vis"),
+    # Register L2 vis.parquets with AT interactive_plotter
+    l2_sidecar = os.path.join(l2_dir, "plots")
+    for fname in [
+        "LAV_displacement_epoch_displacement_grp_vis.parquet",
+        "LAV_vulnerability_vis.parquet",
     ]:
-        if vis is not None:
-            vis_path = os.path.join(l2_dir, f"{prefix}.parquet")
-            vis.write_parquet(vis_path, compression="snappy")
-            register_vis(vis_path, output_dir, prefix, l2_sidecar,
-                         project="LAV", plotter=plotter)
+        vis_path = os.path.join(l2_dir, fname)
+        if os.path.exists(vis_path):
+            register_vis(vis_path, output_dir,
+                         fname.replace(".parquet", ""),
+                         l2_sidecar, project="LAV", plotter=plotter)
 
     # Summary
-    log_info("═" * 60)
+    log_info("=" * 60)
     log_info("Pipeline complete.")
     log_info(f"Successful: {len(country_list) - len(failed)}/{len(country_list)}")
     if failed:
         log_warning(f"Failed: {', '.join(failed)}")
-    log_info(f"Results  → {output_dir}")
-    log_info(f"HTML archive (AnalysisToolbox) → {output_dir}/.bin/LAV_results.html")
+    log_info(f"Results  -> {output_dir}")
+    log_info(f"HTML archive (AnalysisToolbox) -> {output_dir}/.bin/LAV_results.html")
 
 
 if __name__ == "__main__":
