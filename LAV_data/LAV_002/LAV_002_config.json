@@ -1,0 +1,12 @@
+{
+  "participant_id": "LAV_002",
+  "country": "France",
+  "iso3": "FRA",
+  "iso2": "FR",
+  "year_start": 2010,
+  "year_end": 2023,
+  "volt_chapter": "Volt France",
+  "population_millions": 67.8,
+  "eu_member": true,
+  "notes": "Mixed services and industrial economy; major services sector exposure"
+}

@@ -1,0 +1,12 @@
+{
+  "participant_id": "LAV_004",
+  "country": "Belgium",
+  "iso3": "BEL",
+  "iso2": "BE",
+  "year_start": 2010,
+  "year_end": 2023,
+  "volt_chapter": "Volt Belgium",
+  "population_millions": 11.6,
+  "eu_member": true,
+  "notes": "EU administrative hub; pharma and high-tech manufacturing"
+}

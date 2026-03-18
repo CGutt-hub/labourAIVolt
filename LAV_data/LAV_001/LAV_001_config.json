@@ -1,0 +1,12 @@
+{
+  "participant_id": "LAV_001",
+  "country": "Germany",
+  "iso3": "DEU",
+  "iso2": "DE",
+  "year_start": 2010,
+  "year_end": 2023,
+  "volt_chapter": "Volt Deutschland",
+  "population_millions": 83.2,
+  "eu_member": true,
+  "notes": "Largest EU economy; strong manufacturing base at high automation risk"
+}
