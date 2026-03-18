@@ -10,14 +10,14 @@ Import from this module in:
   - Python/analyzers/trend_analyzer.py         (thin CLI wrapper)
   - Python/analyzers/volt_report_analyzer.py   (thin CLI wrapper)
 
-Plotting produces two complementary outputs per run:
-  _vis.parquet  — AnalysisToolbox interactive_plotter format (auto-picked up by
-                  IOInterface in Nextflow; bar charts, year-by-year per sector)
-  _plot.html    — Standalone Plotly.js HTML (lines+markers; each year = one dot;
-                  no extra Python dependencies, CDN-loaded JS)
+Plotting outputs:
+  _vis.parquet  — AnalysisToolbox interactive_plotter format; bar charts
+                  showing employment share and displacement year-by-year.
+                  Registered into a single HTML archive via register_vis()
+                  which calls interactive_plotter.py from the AnalysisToolbox.
+                  In Nextflow the IOInterface bash block auto-calls the plotter.
 """
 
-import json
 import os
 import sys
 import time
@@ -579,149 +579,81 @@ def make_vulnerability_vis(policy_df):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 7. PLOTTING — standalone HTML (Plotly.js CDN, lines+markers per year)
-#    Each year is one dot on the x-axis, connected by a line.
-#    No new Python dependencies — just string templating.
+# 7. PLOTTING — call interactive_plotter.py from the AnalysisToolbox
+#
+#    interactive_plotter.py turns every _vis.parquet into an entry in a single
+#    interactive HTML archive with collapsible tree navigation and Plotly charts.
+#
+#    CLI:  python interactive_plotter.py <vis.parquet> <out_dir> <prefix>
+#                                        <project_name> <sidecar_dir>
+#
+#    The AnalysisToolbox is expected as a sibling directory of this repo:
+#      ../AnalysisToolbox/Python/utils/interactive_plotter.py
+#    Override with env var INTERACTIVE_PLOTTER_PATH if stored elsewhere.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.26.0.min.js"
-
-_COLORS = ["#4e79a7", "#f28e2b", "#76b7b2", "#e15759", "#59a14f", "#edc948"]
-
-
-def _html(title, traces, x_label, y_label, output_path):
-    """Write a self-contained Plotly.js HTML file. No Python deps required."""
-    layout = {
-        "title":    {"text": title, "font": {"size": 18}},
-        "template": "plotly_white",
-        "height":   520,
-        "margin":   {"l": 70, "r": 30, "t": 70, "b": 80},
-        "xaxis":    {"title": x_label, "tickangle": -45},
-        "yaxis":    {"title": y_label},
-        "legend":   {"orientation": "h", "y": -0.25},
-        "barmode":  "group",
-        "hovermode": "x unified",
-    }
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as fh:
-        fh.write(f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>{title}</title>
-<script src="{_PLOTLY_CDN}" charset="utf-8"></script></head>
-<body><div id="p" style="width:100%;height:520px;"></div>
-<script>Plotly.newPlot('p',{json.dumps(traces)},{json.dumps(layout)},{{responsive:true}});</script>
-</body></html>
-""")
-
-
-def write_country_html_plots(df_wide, df_disp, output_dir, participant_id):
+def find_interactive_plotter():
     """
-    Write two standalone HTML plots for one country to output_dir/plots/:
-      1. Employment share by sector — lines+markers, each year = one dot
-      2. Displacement scores — bar chart per sector
+    Locate interactive_plotter.py from the AnalysisToolbox.
+    Returns the absolute path, or None if not found.
     """
-    os.makedirs(os.path.join(output_dir, "plots"), exist_ok=True)
-    country = df_wide["country"][0]
+    # Env var override (useful in CI)
+    env_path = os.environ.get("INTERACTIVE_PLOTTER_PATH", "")
+    if env_path and os.path.exists(env_path):
+        return env_path
 
-    # ── Plot 1: Employment share by sector (lines+markers) ────────────────
-    traces1 = []
-    for i, (sector, col) in enumerate(SECTOR_COLUMNS.items()):
-        if col not in df_wide.columns:
-            continue
-        years, values = _extract_ts(df_wide, col)
-        if not years:
-            continue
-        traces1.append({
-            "type": "scatter", "mode": "lines+markers",
-            "name": sector, "x": years, "y": values,
-            "line": {"color": _COLORS[i % len(_COLORS)], "width": 2},
-            "marker": {"size": 6},
-        })
-    if traces1:
-        _html(f"Employment Share by Sector — {country}",
-              traces1, "Year", "Employment Share (%)",
-              os.path.join(output_dir, "plots", f"{participant_id}_sector_employment_plot.html"))
+    # Standard sibling-repo layout:  ../AnalysisToolbox/Python/utils/
+    this_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidate = os.path.join(os.path.dirname(this_repo),
+                             "AnalysisToolbox", "Python", "utils",
+                             "interactive_plotter.py")
+    if os.path.exists(candidate):
+        return candidate
 
-    # ── Plot 2: Unemployment rates (lines+markers) ────────────────────────
-    UNEMP_SERIES = [
-        ("unemployment_rate",       "Unemployment Rate (%)",   "#e15759"),
-        ("youth_unemployment_rate", "Youth Unemployment (%)",  "#f28e2b"),
-        ("employment_to_pop_ratio", "Emp./Population Ratio (%)", "#76b7b2"),
-    ]
-    traces2 = []
-    for col, label, color in UNEMP_SERIES:
-        if col not in df_wide.columns:
-            continue
-        years, values = _extract_ts(df_wide, col)
-        if not years:
-            continue
-        traces2.append({
-            "type": "scatter", "mode": "lines+markers",
-            "name": label, "x": years, "y": values,
-            "line": {"color": color, "width": 2}, "marker": {"size": 6},
-        })
-    if traces2:
-        _html(f"Labour Market Indicators — {country}",
-              traces2, "Year", "Rate / Ratio (%)",
-              os.path.join(output_dir, "plots", f"{participant_id}_labour_indicators_plot.html"))
-
-    # ── Plot 3: Displacement scores (bar per sector) ───────────────────────
-    if df_disp is not None and len(df_disp) > 0:
-        df_s = df_disp.sort("displacement_score", descending=True)
-        traces3 = [{
-            "type": "bar",
-            "x": df_s["sector"].to_list(),
-            "y": [round(v, 5) for v in df_s["displacement_score"].to_list()],
-            "text": [f"slope={round(s, 3)} pp/yr" for s in df_s["trend_slope_pp_per_yr"].to_list()],
-            "textposition": "outside",
-            "marker": {"color": [_COLORS[i % len(_COLORS)]
-                                 for i in range(len(df_s))]},
-            "name": "Displacement Score",
-        }]
-        _html(f"AI Displacement Score by Sector — {country}",
-              traces3, "Sector", "Score (signal × automation risk)",
-              os.path.join(output_dir, "plots", f"{participant_id}_displacement_score_plot.html"))
+    log_warning(
+        f"AnalysisToolbox not found at expected path: {candidate}\n"
+        "  Clone https://github.com/CGutt-hub/AnalysisToolbox alongside this repo,\n"
+        "  or set INTERACTIVE_PLOTTER_PATH env var.",
+        "plotter")
+    return None
 
 
-def write_group_html_plots(df_disp_all, policy_df, output_dir):
+def register_vis(vis_parquet, archive_root, prefix, sidecar_dir,
+                 project="LAV", plotter=None):
     """
-    Write cross-country HTML plots to output_dir/plots/:
-      1. Grouped bar: displacement score by sector per country
-      2. Grouped bar: ADPI and vulnerability score per country
+    Register one _vis.parquet file with interactive_plotter.py.
+
+    Parameters
+    ----------
+    vis_parquet  : path to the _vis.parquet produced by a make_*_vis() function
+    archive_root : root directory for the HTML archive
+                   (archive lives at <archive_root>/.bin/LAV_results.html)
+    prefix       : plot identifier used in the tree (e.g. LAV_001_sector_employment_vis)
+    sidecar_dir  : directory where the parquet sidecar copy is stored
+                   (e.g. LAV_results/LAV_l1/LAV_001/plots/)
+    project      : project name for the HTML archive filename
+    plotter      : path to interactive_plotter.py (auto-detected if None)
     """
-    os.makedirs(os.path.join(output_dir, "plots"), exist_ok=True)
-
-    # ── Plot 1: Displacement score by sector, grouped by country ──────────
-    if df_disp_all is not None and len(df_disp_all) > 0:
-        countries = sorted(df_disp_all["country"].unique().to_list())
-        traces1   = []
-        for i, sector in enumerate(SECTOR_COLUMNS):
-            scores = []
-            for country in countries:
-                row = df_disp_all.filter(
-                    (pl.col("country") == country) & (pl.col("sector") == sector))
-                scores.append(float(row["displacement_score"][0]) if len(row) > 0 else 0.0)
-            traces1.append({
-                "type": "bar", "name": sector,
-                "x": countries, "y": [round(s, 5) for s in scores],
-                "marker": {"color": _COLORS[i % len(_COLORS)]},
-            })
-        if traces1:
-            _html("AI Displacement Score by Country and Sector",
-                  traces1, "Country", "Displacement Score",
-                  os.path.join(output_dir, "plots", "LAV_cross_country_displacement_plot.html"))
-
-    # ── Plot 2: ADPI + Vulnerability per country ──────────────────────────
-    if policy_df is not None and len(policy_df) > 0:
-        df_s   = policy_df.sort("adpi", descending=True)
-        ctries = df_s["country"].to_list()
-        traces2 = [
-            {"type": "bar", "name": "ADPI",
-             "x": ctries, "y": [round(v or 0.0, 4) for v in df_s["adpi"].to_list()],
-             "marker": {"color": _COLORS[0]}},
-            {"type": "bar", "name": "Vulnerability (ADPI/DRS)",
-             "x": ctries, "y": [round(v or 0.0, 4) for v in df_s["vulnerability_score"].to_list()],
-             "marker": {"color": _COLORS[3]}},
-        ]
-        _html("Labour Displacement Vulnerability by Country",
-              traces2, "Country", "Score",
-              os.path.join(output_dir, "plots", "LAV_vulnerability_plot.html"))
+    import subprocess
+    if plotter is None:
+        plotter = find_interactive_plotter()
+    if plotter is None:
+        log_warning(
+            "AnalysisToolbox interactive_plotter.py not found — skipping HTML registration.\n"
+            "  Clone https://github.com/CGutt-hub/AnalysisToolbox alongside this repo,\n"
+            "  or set INTERACTIVE_PLOTTER_PATH env var.",
+            "plotter")
+        return
+    os.makedirs(sidecar_dir, exist_ok=True)
+    result = subprocess.run(
+        [sys.executable, "-u", plotter,
+         os.path.abspath(vis_parquet),
+         os.path.abspath(archive_root),
+         prefix,
+         project,
+         os.path.abspath(sidecar_dir)],
+        check=False,
+    )
+    if result.returncode != 0:
+        log_warning(f"interactive_plotter returned exit code {result.returncode} "
+                    f"for prefix '{prefix}'", "plotter")

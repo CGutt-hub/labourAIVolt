@@ -34,7 +34,7 @@ from lav_pipeline import (
     generate_volt_report, _concat_frames,
     make_sector_employment_vis, make_unemployment_vis,
     make_displacement_score_vis, make_group_adpi_vis, make_vulnerability_vis,
-    write_country_html_plots, write_group_html_plots,
+    register_vis, find_interactive_plotter,
     VOLT_COUNTRIES, _VOLT_BY_ISO2,
     log_info, log_warning, log_error,
 )
@@ -85,10 +85,11 @@ def resolve_countries(data_dir, countries_arg):
 
 # ── Per-country L1 pipeline ───────────────────────────────────────────────────
 
-def process_country(cfg, l1_dir):
+def process_country(cfg, l1_dir, output_dir, plotter=None):
     """Run full L1 pipeline for one country. Returns (df_disp, df_trends) or (None, None)."""
     pid      = cfg["participant_id"]
     work_dir = os.path.join(l1_dir, pid)
+    sidecar  = os.path.join(work_dir, "plots")
     os.makedirs(work_dir, exist_ok=True)
 
     log_info("─" * 60)
@@ -116,32 +117,25 @@ def process_country(cfg, l1_dir):
     if len(df_disp) > 0:
         df_disp.write_parquet(os.path.join(work_dir, f"{pid}_displacement.parquet"),
                               compression="snappy")
-        # vis.parquet for AnalysisToolbox
-        vis_emp  = make_sector_employment_vis(df_wide)
-        vis_disp = make_displacement_score_vis(df_disp)
-        if vis_emp:
-            vis_emp.write_parquet(
-                os.path.join(work_dir, f"{pid}_sector_employment_vis.parquet"),
-                compression="snappy")
-        if vis_disp:
-            vis_disp.write_parquet(
-                os.path.join(work_dir, f"{pid}_displacement_score_vis.parquet"),
-                compression="snappy")
 
     # Step 3b — Trend analysis
     df_trends = analyze_trends(df_wide)
     if len(df_trends) > 0:
         df_trends.write_parquet(os.path.join(work_dir, f"{pid}_trends.parquet"),
                                 compression="snappy")
-        vis_unemp = make_unemployment_vis(df_wide)
-        if vis_unemp:
-            vis_unemp.write_parquet(
-                os.path.join(work_dir, f"{pid}_unemployment_vis.parquet"),
-                compression="snappy")
 
-    # HTML plots — each year as a dot (lines+markers)
-    write_country_html_plots(df_wide, df_disp if len(df_disp) > 0 else None,
-                             work_dir, pid)
+    # Step 4 — Build vis.parquets and register with AnalysisToolbox interactive_plotter
+    _vis_plots = [
+        (make_sector_employment_vis(df_wide),                               f"{pid}_sector_employment_vis"),
+        (make_unemployment_vis(df_wide),                                    f"{pid}_unemployment_vis"),
+        (make_displacement_score_vis(df_disp if len(df_disp) > 0 else None), f"{pid}_displacement_score_vis"),
+    ]
+    for vis, prefix in _vis_plots:
+        if vis is not None:
+            vis_path = os.path.join(work_dir, f"{prefix}.parquet")
+            vis.write_parquet(vis_path, compression="snappy")
+            register_vis(vis_path, output_dir, prefix, sidecar,
+                         project="LAV", plotter=plotter)
 
     return (df_disp   if len(df_disp)   > 0 else None,
             df_trends if len(df_trends) > 0 else None)
@@ -167,8 +161,16 @@ def main(data_dir, output_dir, countries_arg):
     log_info(f"Countries to process: {len(country_list)}")
 
     all_disp, all_trends, failed = [], [], []
+    plotter = find_interactive_plotter()
+    if plotter:
+        log_info(f"AnalysisToolbox interactive_plotter found: {plotter}")
+    else:
+        log_warning("AnalysisToolbox not found — vis.parquet files will be written "
+                    "but HTML archive will not be generated.\n"
+                    "  Clone https://github.com/CGutt-hub/AnalysisToolbox alongside "
+                    "this repo, or set INTERACTIVE_PLOTTER_PATH.")
     for cfg in country_list:
-        df_disp, df_trends = process_country(cfg, l1_dir)
+        df_disp, df_trends = process_country(cfg, l1_dir, output_dir, plotter)
         if df_disp is None and df_trends is None:
             failed.append(cfg["participant_id"])
         if df_disp   is not None: all_disp.append(df_disp)
@@ -179,19 +181,18 @@ def main(data_dir, output_dir, countries_arg):
     log_info("Running group-level Volt report …")
     policy = generate_volt_report(all_disp, all_trends, l2_dir)
 
-    # L2 vis.parquet + HTML plots
+    # L2 vis.parquet — register with interactive_plotter
+    l2_sidecar  = os.path.join(l2_dir, "plots")
     df_disp_all = _concat_frames(all_disp)
-    vis_adpi = make_group_adpi_vis(df_disp_all)
-    vis_vuln = make_vulnerability_vis(policy if len(policy) > 0 else None)
-    if vis_adpi:
-        vis_adpi.write_parquet(os.path.join(l2_dir, "LAV_cross_country_adpi_vis.parquet"),
-                               compression="snappy")
-    if vis_vuln:
-        vis_vuln.write_parquet(os.path.join(l2_dir, "LAV_vulnerability_vis.parquet"),
-                               compression="snappy")
-    write_group_html_plots(df_disp_all,
-                           policy if len(policy) > 0 else None,
-                           l2_dir)
+    for vis, prefix in [
+        (make_group_adpi_vis(df_disp_all),                              "LAV_cross_country_adpi_vis"),
+        (make_vulnerability_vis(policy if len(policy) > 0 else None),   "LAV_vulnerability_vis"),
+    ]:
+        if vis is not None:
+            vis_path = os.path.join(l2_dir, f"{prefix}.parquet")
+            vis.write_parquet(vis_path, compression="snappy")
+            register_vis(vis_path, output_dir, prefix, l2_sidecar,
+                         project="LAV", plotter=plotter)
 
     # Summary
     log_info("═" * 60)
@@ -200,11 +201,7 @@ def main(data_dir, output_dir, countries_arg):
     if failed:
         log_warning(f"Failed: {', '.join(failed)}")
     log_info(f"Results  → {output_dir}")
-    log_info(f"HTML plots:")
-    for country_cfg in country_list:
-        pid = country_cfg["participant_id"]
-        log_info(f"  {l1_dir}/{pid}/plots/")
-    log_info(f"  {l2_dir}/plots/")
+    log_info(f"HTML archive (AnalysisToolbox) → {output_dir}/.bin/LAV_results.html")
 
 
 if __name__ == "__main__":

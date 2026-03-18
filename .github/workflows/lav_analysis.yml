@@ -54,8 +54,17 @@ jobs:
           # Fetch full history so the result-commit step can push cleanly
           fetch-depth: 0
 
-      # ── 2. Python environment ─────────────────────────────────────────────
-      - name: Set up Python
+      # ── 2. Checkout AnalysisToolbox (sibling repo) ───────────────────────
+      #    Placed at ../AnalysisToolbox so interactive_plotter.py is auto-found
+      #    by lav_pipeline.find_interactive_plotter().
+      - name: Checkout AnalysisToolbox
+        uses: actions/checkout@v4
+        with:
+          repository: CGutt-hub/AnalysisToolbox
+          path: ../AnalysisToolbox
+          fetch-depth: 1
+
+      # ── 3. Python environment ─────────────────────────────────────────────      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -65,7 +74,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r Python/requirements.txt
 
-      # ── 3. Run the LAV analysis pipeline ──────────────────────────────────
+      # ── 4. Run the LAV analysis pipeline ──────────────────────────────────
       #    --countries all  →  uses the embedded Volt country list; no LAV_data/
       #                        config files are required.
       #    year_end is omitted  →  api_reader auto-detects the latest year
@@ -80,7 +89,7 @@ jobs:
             --countries  "${{ github.event.inputs.countries  || 'all' }}" \
             --output-dir "${{ github.event.inputs.output_dir || 'LAV_results' }}"
 
-      # ── 4. Upload results as a downloadable artifact ──────────────────────
+      # ── 5. Upload results as a downloadable artifact ──────────────────────
       - name: Upload LAV results
         uses: actions/upload-artifact@v4
         with:
@@ -89,7 +98,7 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-      # ── 5. Commit results back to the repository ──────────────────────────
+      # ── 6. Commit results back to the repository ──────────────────────────
       #    Only commits when there are actual changes (idempotent).
       - name: Commit and push results
         run: |
