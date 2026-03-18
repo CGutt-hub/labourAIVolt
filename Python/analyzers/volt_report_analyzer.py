@@ -234,6 +234,8 @@ def run(input_paths):
         log_info("Saved → LAV_trends_summary.parquet")
 
     # Write combined report
+    # Use diagonal concat so each table keeps its own columns;
+    # missing columns are filled with null rather than using misleading aliases.
     report_parts = []
     if df_disp is not None and len(df_disp) > 0:
         report_parts.append(
@@ -241,15 +243,7 @@ def run(input_paths):
         )
     if len(policy_metrics) > 0:
         report_parts.append(
-            policy_metrics.select(
-                pl.lit("policy_metrics").alias("table_type"),
-                pl.col("participant_id"),
-                pl.col("country"),
-                pl.col("iso3"),
-                pl.col("adpi").alias("displacement_score"),
-                pl.col("drs").alias("employment_mean_pct"),
-                pl.col("vulnerability_score").alias("automation_risk_frey_osborne"),
-            )
+            policy_metrics.with_columns(pl.lit("policy_metrics").alias("table_type"))
         )
 
     if report_parts:

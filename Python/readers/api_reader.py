@@ -85,7 +85,7 @@ def fetch_worldbank(iso2, indicator_name, indicator_code,
             return records
         except requests.exceptions.Timeout:
             log_warning(
-                f"Timeout on attempt {attempt + 1}/{ retries} for {indicator_name}"
+                f"Timeout on attempt {attempt + 1}/{retries} for {indicator_name}"
             )
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
