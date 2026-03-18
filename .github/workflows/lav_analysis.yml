@@ -1,0 +1,116 @@
+name: LAV Labour-AI-Volt Analysis
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  # Automatic: every Monday at 06:00 UTC.
+  # The World Bank publishes annual employment data throughout the year.
+  # The pipeline auto-detects the latest available year on every run via the
+  # API's `mrv=1` (most-recent-value) endpoint — so new data is captured
+  # automatically as soon as it appears, with no manual year_end changes needed.
+  schedule:
+    - cron: '0 6 * * 1'
+
+  # Manual: trigger from the Actions tab with optional overrides
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: >
+          Countries to analyse: 'all' for all embedded Volt countries, or a
+          comma-separated list of ISO-2 codes (e.g. 'DE,FR,NL').
+          Leave blank to use the embedded list automatically.
+        required: false
+        default: 'all'
+      output_dir:
+        description: 'Output directory (relative to repo root)'
+        required: false
+        default: 'LAV_results'
+
+  # Automatic: re-run whenever analysis scripts change
+  push:
+    branches:
+      - main
+    paths:
+      - 'LAV_data/**'
+      - 'Python/**'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Permissions — needed so the action can commit results back to the repo
+# ─────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write
+
+jobs:
+  analyse:
+    name: Run LAV Analysis Pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout labourAIVolt
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so the result-commit step can push cleanly
+          fetch-depth: 0
+
+      # ── 2. Checkout AnalysisToolbox (sibling repo) ───────────────────────
+      #    Placed at ../AnalysisToolbox so interactive_plotter.py is auto-found
+      #    by lav_pipeline.find_interactive_plotter().
+      - name: Checkout AnalysisToolbox
+        uses: actions/checkout@v4
+        with:
+          repository: CGutt-hub/AnalysisToolbox
+          path: ../AnalysisToolbox
+          fetch-depth: 1
+
+      # ── 3. Python environment ─────────────────────────────────────────────      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: Python/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r Python/requirements.txt
+
+      # ── 4. Run the LAV analysis pipeline ──────────────────────────────────
+      #    --countries all  →  uses the embedded Volt country list; no LAV_data/
+      #                        config files are required.
+      #    year_end is omitted  →  api_reader auto-detects the latest year
+      #                            currently available in the World Bank API,
+      #                            so new data is picked up the moment it is
+      #                            published without any code changes.
+      - name: Run LAV pipeline
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          python Python/lav_run.py \
+            --countries  "${{ github.event.inputs.countries  || 'all' }}" \
+            --output-dir "${{ github.event.inputs.output_dir || 'LAV_results' }}"
+
+      # ── 5. Upload results as a downloadable artifact ──────────────────────
+      - name: Upload LAV results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lav-results-${{ github.run_number }}
+          path: LAV_results/
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ── 6. Commit results back to the repository ──────────────────────────
+      #    Only commits when there are actual changes (idempotent).
+      - name: Commit and push results
+        run: |
+          git config user.name  "LAV Pipeline [bot]"
+          git config user.email "lav-pipeline@automated.local"
+
+          git add LAV_results/
+
+          if git diff --cached --quiet; then
+            echo "No result changes to commit."
+          else
+            git commit -m \
+              "autosync: LAV analysis results [run #${{ github.run_number }}]"
+            git push
+          fi

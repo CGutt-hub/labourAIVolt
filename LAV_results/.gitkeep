@@ -1,0 +1,20 @@
+# LAV_results — pipeline output directory
+# Mirrors the EV_results/ layout used by EmotiView.
+#
+# Layout produced at runtime:
+#   LAV_results/
+#     .bin/                     shared infrastructure (logs, HTML archive)
+#     LAV_l1/                   per-country first-level results
+#       LAV_001/                 Germany
+#         plots/                 parquet output copies & vis
+#         LAV_001_api_raw.parquet
+#         LAV_001_normalized.parquet
+#         LAV_001_displacement.parquet
+#         LAV_001_trends.parquet
+#         LAV_001.log.parquet    live execution log
+#       LAV_002/  …
+#     LAV_l2/                   cross-country group-level results
+#       LAV_volt_report.parquet
+#       LAV_displacement_summary.parquet
+#       LAV_trends_summary.parquet
+#       LAV_l2.log.parquet
